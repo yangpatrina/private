@@ -1,0 +1,227 @@
+import re
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin, urlunparse, quote, unquote
+import hashlib
+from collections import Counter
+from requests.exceptions import Timeout, RequestException
+from stopwords import stop_words
+
+# keeps track of scraped URLs and content hashes to avoid reprocessing
+visited_urls = set()
+error_urls = set()
+content_hashes = set()
+simhash_values = {}
+url_skip_patterns = {}
+
+# data structures for report
+longest_page = None
+longest_page_word_count = 0
+common_words = Counter()
+subdomains = {}
+
+def is_valid(url):
+    # Checks if a URL is valid if it belongs to one of the domains
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+
+        # Check if the domain of the URL is one of the domains
+        if not any(domain in parsed.netloc for domain in ["ics.uci.edu", "cs.uci.edu", "informatics.uci.edu", "stat.uci.edu"]):
+            return False
+        return True
+    except TypeError:
+        print("TypeError for URL:", url)
+        return False
+
+def normalize_url(url):
+    # Prevent duplicates
+    try:
+        parsed_url = urlparse(url)
+        normalized_path = quote(parsed_url.path.encode('utf-8'), safe="/:%")
+        normalized_url = urlunparse(
+            (parsed_url.scheme, parsed_url.netloc, normalized_path,
+             parsed_url.params, parsed_url.query, parsed_url.fragment))
+        return normalized_url
+    except Exception as e:
+        print(f"Error normalizing URL {url}: {e}")
+        return None
+    
+def simhash(features):
+    v = [0] * 64 # initialize list of 64 zeros
+    for feature in features:
+        hash_val = bin(int(hashlib.sha256(feature.encode('utf-8')).hexdigest(), 16))[2:].zfill(64)
+        for i in range(64): # iterates over each bit in the 64 bit hash
+            if hash_val[i] == '1':
+                v[i] += 1
+            else:
+                v[i] -= 1
+    simhash = 0
+    for i in range(64):
+        if v[i] > 0:
+            simhash |= 1 << i
+    return simhash
+
+def hamming_distance(hash1, hash2):
+    x = hash1 ^ hash2
+    dist = 0
+    while x:
+        dist += 1
+        x &= x - 1
+    return dist
+
+def detect_near_duplicate(content, url):
+    features = re.findall(r'\b\w+\b', content.lower())
+    current_simhash = simhash(features)
+    for existing_url, existing_simhash in simhash_values.items():
+        if existing_url != url and hamming_distance(current_simhash, existing_simhash) < 5:  # Adjust threshold as needed
+            return True
+    simhash_values[url] = current_simhash
+    return False
+
+def detect_similar_content(text_content):
+    # Detects if content has already been seen
+    content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
+    if content_hash in content_hashes:
+        return True  # Similar or duplicate content detected
+    else:
+        content_hashes.add(content_hash)
+        return False  # New content
+
+def detect_infinite_traps(url):
+    # Detecting potential infinite traps based on patterns
+    pattern = re.compile(r'\d+$')  # URLs ending in numbers
+    match = pattern.search(url)
+    max_length = 200
+    if match:
+        base_url = url[:match.start()]
+        if base_url in visited_urls or len(url) > max_length:
+            return True
+    return False
+    
+def detect_pattern_and_skip(url):
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
+    
+    if domain not in url_skip_patterns:
+        url_skip_patterns[domain] = {}
+    path_segments = parsed_url.path.strip('/').split('/')
+    base_pattern = '/'.join(path_segments[:-1])
+    
+    trailing_segment = path_segments[-1] if path_segments else ""
+    numeric_match = re.search(r'\d+', trailing_segment)
+    if numeric_match:
+        # Initialize base_pattern key if not present
+        if base_pattern not in url_skip_patterns[domain]:
+            url_skip_patterns[domain][base_pattern] = set()
+        if trailing_segment in url_skip_patterns[domain][base_pattern]:
+            return True  # Skip if the segment was seen before
+        else:
+            # Store new trailing segment for future comparison
+            url_skip_patterns[domain][base_pattern].add(trailing_segment)
+    return False
+
+
+
+def is_relevant_url(url):
+    # defines patterns to exclude
+    excluded_patterns = [
+        r'/tag/',  # Tag pages
+        r'/page/\d+/$',  # Pagination
+        r'\.r$', r'\.m$',  # Specific file extensions
+    ]
+    
+    for pattern in excluded_patterns:
+        if re.search(pattern, url):
+            return False  # URL matches an excluded pattern
+    return True  # URL passes all checks
+
+def downloadurl(url):
+    if url in error_urls:  # skips if URL previously resulted in an error
+        return None
+    try:
+        with requests.get(url, stream=True) as r: #checks the content length 
+            content_length = int(r.headers.get('Content-Length', 0))
+            # if content exceeds 10MB, skips downloading file
+            if content_length > 10 * 1024 * 1024:
+                print(f"Skipping large file: {url}")
+                return None #indicates file was skipped
+            if r.status_code == 200:
+                return r.text
+            else:
+                error_urls.add(url) # logs the failure
+                print(f"Failed to retrieve {url} with status code {r.status_code}")
+                return None
+    except Timeout: # handle specific request to timeouts 
+        print(f"Request to {url} timed out.")
+        error_urls.add(url)
+        return None
+    except RequestException as e:
+        print(f"Error during requests to {url}: {str(e)}")
+        error_urls.add(url)
+        return None
+
+def extract_next_links(url, html_content):
+    soup = BeautifulSoup(html_content, 'lxml') # parse HTML content of current page
+    for link in soup.find_all('a'): # find hyperlinks
+        href = link.get('href') # href attribute value
+        if href: # checking if href attributes exists to avoid processing NoneType objects
+            absolute_link = urljoin(url, href) # convert relative URLs to absolute URLs
+            normalized_link = normalize_url(absolute_link) # normalize URL to standard format
+            if normalized_link not in visited_urls and is_valid(normalized_link) and not detect_pattern_and_skip(normalized_link): # prevents revisiting 
+                if detect_pattern_and_skip(normalized_link):  # check patterns
+                    print(f"Skipping URL due to detected pattern: {normalized_link}")
+                    continue
+                yield normalized_link
+
+def count_words_and_update_common_words(html_content):
+    soup = BeautifulSoup(html_content, 'lxml') # parse HTML content
+    text = soup.get_text() # removes HTML tags to get all text
+    words = re.findall(r'\b\w+\b', text.lower())
+    words = [word for word in words if word not in stop_words] # filter out stop words
+    return len(words), words # count of words and filtered list of words
+
+def add_to_subdomains(url):
+    parsed_url = urlparse(url) # for subdomain info
+    subdomain = parsed_url.netloc
+    if subdomain not in subdomains:
+        subdomains[subdomain] = set()
+    subdomains[subdomain].add(url) # add it to set
+
+def scraper(start_url):
+    global longest_page, longest_page_word_count
+    queue = [start_url] # initialize
+
+    while queue:
+        url = queue.pop(0) # pops first URL 
+        normalized_url = normalize_url(url)
+        if normalized_url in visited_urls or normalized_url in error_urls or detect_infinite_traps(normalized_url): # skips URL if processed
+            continue
+
+        visited_urls.add(normalized_url)
+        print(f"Scraping URL: {url}") #log URL
+        html_content = downloadurl(url)
+        if html_content and not detect_similar_content(html_content):
+            for next_url in extract_next_links(url, html_content): # process and extract next links
+                normalized_next_url = normalize_url(next_url)
+                if normalized_next_url not in visited_urls and normalized_next_url not in error_urls:
+                    queue.append(next_url)
+    print(f"Scraping completed. Number of unique pages visited: {len(visited_urls)}")
+
+if __name__ == "__main__":
+    start_urls = [
+        "http://www.ics.uci.edu/",
+        "http://www.cs.uci.edu/",
+        "http://www.informatics.uci.edu/",
+        "http://www.stat.uci.edu/"
+    ]
+    for url in start_urls:
+        scraper(url) # runs the scraper for each start URL
+    
+    print(f"Number of unique pages visited: {len(visited_urls)}")
+    print(f"Longest page ({longest_page_word_count} words): {longest_page}")
+    print("50 most common words:", common_words.most_common(50))
+    print("Subdomains and page counts:")
+    for domain, pages in sorted(subdomains.items()):
+        print(f"{domain}, {len(pages)}")
